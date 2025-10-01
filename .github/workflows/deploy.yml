@@ -8,6 +8,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
     - name: Checkout code
@@ -20,15 +21,13 @@ jobs:
         port: ${{ secrets.VPS_PORT }}
         username: ${{ secrets.VPS_USER }}
         key: ${{ secrets.VPS_SSH_KEY }}
+        command_timeout: 45m
         script: |
           set -e
 
           echo "Updating Docmost..."
 
           cd /opt/docmost/app
-
-          echo "Creating backup before update..."
-          /root/backup-docmost-strych.sh || echo "Warning: Backup failed, continuing..."
 
           echo "Fetching latest code from GitHub..."
           git fetch origin
@@ -38,9 +37,13 @@ jobs:
           cd /opt/docmost
           docker compose down
 
-          echo "Building new Docker image..."
+          echo "Building new Docker image (this may take 10-15 minutes)..."
           cd /opt/docmost/app
-          docker build -t docmost-btc:latest .
+
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -t docmost-btc:latest .
 
           echo "Starting new containers..."
           cd /opt/docmost
