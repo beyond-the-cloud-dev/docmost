@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { MAIL_DRIVER_TOKEN } from './mail.constants';
 import { MailDriver } from './drivers/interfaces/mail-driver.interface';
 import { MailMessage } from './interfaces/mail.message';
@@ -10,6 +10,8 @@ import { render } from '@react-email/render';
 
 @Injectable()
 export class MailService {
+  private readonly logger = new Logger(MailService.name);
+
   constructor(
     @Inject(MAIL_DRIVER_TOKEN) private mailDriver: MailDriver,
     private readonly environmentService: EnvironmentService,
@@ -31,6 +33,14 @@ export class MailService {
     }
 
     const sender = `${this.environmentService.getMailFromName()} <${from}> `;
+
+    this.logger.debug(`Sending email - MAIL_FROM_ADDRESS: ${this.environmentService.getMailFromAddress()}`);
+    this.logger.debug(`Sending email - MAIL_FROM_NAME: ${this.environmentService.getMailFromName()}`);
+    this.logger.debug(`Sending email - message.from: ${message.from}`);
+    this.logger.debug(`Sending email - computed from: ${from}`);
+    this.logger.debug(`Sending email - final sender: ${sender}`);
+    this.logger.debug(`Sending email - to: ${message.to}`);
+
     await this.mailDriver.sendMail({ from: sender, ...message });
   }
 
