@@ -1,4 +1,4 @@
-name: Deploy to VPS
+name: Build and Deploy to VPS
 
 on:
   push:
@@ -6,14 +6,39 @@ on:
   workflow_dispatch:
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/docmost:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          NODE_OPTIONS=--max-old-space-size=4096
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
     - name: Deploy to VPS
       uses: appleboy/ssh-action@v1.0.0
       with:
@@ -21,32 +46,21 @@ jobs:
         port: ${{ secrets.VPS_PORT }}
         username: ${{ secrets.VPS_USER }}
         key: ${{ secrets.VPS_SSH_KEY }}
-        command_timeout: 45m
+        command_timeout: 15m
         script: |
           set -e
 
           echo "Updating Docmost..."
 
-          cd /opt/docmost/app
+          cd /opt/docmost
 
-          echo "Fetching latest code from GitHub..."
-          git fetch origin
-          git reset --hard origin/main
+          echo "Pulling new image from Docker Hub..."
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/docmost:latest
 
           echo "Stopping old containers..."
-          cd /opt/docmost
           docker compose down
 
-          echo "Building new Docker image (this may take 10-15 minutes)..."
-          cd /opt/docmost/app
-
-          DOCKER_BUILDKIT=1 docker build \
-            --progress=plain \
-            --build-arg BUILDKIT_INLINE_CACHE=1 \
-            -t docmost-btc:latest .
-
           echo "Starting new containers..."
-          cd /opt/docmost
           docker compose up -d
 
           sleep 15
