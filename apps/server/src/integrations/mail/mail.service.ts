@@ -32,7 +32,8 @@ export class MailService {
       from = message.from;
     }
 
-    const sender = `${this.environmentService.getMailFromName()} <${from}>`;
+    // Use just the email address without the name for now to debug SMTP issue
+    const sender = from;
 
     this.logger.debug(`Sending email - MAIL_FROM_ADDRESS: ${this.environmentService.getMailFromAddress()}`);
     this.logger.debug(`Sending email - MAIL_FROM_NAME: ${this.environmentService.getMailFromName()}`);

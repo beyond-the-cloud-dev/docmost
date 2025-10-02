@@ -45,6 +45,7 @@ export const mailDriverConfigProvider = {
             auth,
             secure: environmentService.getSmtpSecure(),
             ignoreTLS: environmentService.getSmtpIgnoreTLS(),
+            from: environmentService.getMailFromAddress(),
           } as SMTPTransport.Options,
         };
       }
