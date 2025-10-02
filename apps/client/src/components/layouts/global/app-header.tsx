@@ -72,15 +72,13 @@ export function AppHeader() {
             </>
           )}
 
-          <Text
-            size="lg"
-            fw={600}
-            style={{ cursor: "pointer", userSelect: "none" }}
-            component={Link}
-            to="/home"
-          >
-            Docmost
-          </Text>
+          <Link to="/home" style={{ display: "flex", alignItems: "center" }}>
+            <img
+              src="/logo.png"
+              alt="Company Logo"
+              style={{ height: "24px", width: "auto", cursor: "pointer" }}
+            />
+          </Link>
 
           <Group ml={50} gap={5} className={classes.links} visibleFrom="sm">
             {items}
