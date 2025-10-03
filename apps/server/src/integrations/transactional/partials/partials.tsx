@@ -1,10 +1,10 @@
-import { container, footer, h1, logo, main } from '../css/styles';
+import { container, footer, footerText, headerSection, logo, logoImage, main } from '../css/styles';
 import {
   Body,
   Container,
   Head,
   Html,
-  Row,
+  Img,
   Section,
   Text,
 } from '@react-email/components';
@@ -19,8 +19,10 @@ export function MailBody({ children }: MailBodyProps) {
     <Html>
       <Head />
       <Body style={main}>
-        <MailHeader />
-        <Container style={container}>{children}</Container>
+        <Container style={container}>
+          <MailHeader />
+          {children}
+        </Container>
         <MailFooter />
       </Body>
     </Html>
@@ -29,8 +31,15 @@ export function MailBody({ children }: MailBodyProps) {
 
 export function MailHeader() {
   return (
-    <Section style={logo}>
-      {/* <Heading style={h1}>docmost</Heading> */}
+    <Section style={headerSection}>
+      <Section style={logo}>
+        <Img
+          src="https://raw.githubusercontent.com/beyond-the-cloud-dev/.github/main/assets/logo-dark.png"
+          alt="Beyond the Cloud"
+          style={logoImage}
+          draggable={false}
+        />
+      </Section>
     </Section>
   );
 }
@@ -38,11 +47,9 @@ export function MailHeader() {
 export function MailFooter() {
   return (
     <Section style={footer}>
-      <Row>
-        <Text style={{ textAlign: 'center', color: '#706a7b' }}>
-          © {new Date().getFullYear()} Docmost, All Rights Reserved <br />
-        </Text>
-      </Row>
+      <Text style={footerText}>
+        © {new Date().getFullYear()} Beyond the Cloud. All rights reserved.
+      </Text>
     </Section>
   );
 }

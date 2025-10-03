@@ -1,6 +1,6 @@
-import { Button, Link, Section, Text } from '@react-email/components';
+import { Button, Hr, Section, Text } from '@react-email/components';
 import * as React from 'react';
-import { button, content, paragraph } from '../css/styles';
+import { button, buttonWrapper, content, divider, h1, paragraph, colors } from '../css/styles';
 import { MailBody } from '../partials/partials';
 
 interface Props {
@@ -12,13 +12,23 @@ export const ForgotPasswordEmail = ({ username, resetLink }: Props) => {
   return (
     <MailBody>
       <Section style={content}>
+        <Text style={h1}>Password Reset Request</Text>
         <Text style={paragraph}>Hi {username},</Text>
         <Text style={paragraph}>
-          We received a request from you to reset your password.
+          We received a request to reset your password for your Beyond the Cloud account.
         </Text>
-          <Link href={resetLink}> Click here to set a new password</Link>
         <Text style={paragraph}>
-          If you did not request a password reset, please ignore this email.
+          Click the button below to create a new password. This link will expire in 24 hours for security reasons.
+        </Text>
+        <Hr style={divider} />
+        <Section style={buttonWrapper}>
+          <Button href={resetLink} style={button}>
+            Reset Password
+          </Button>
+        </Section>
+        <Hr style={divider} />
+        <Text style={{...paragraph, fontSize: '14px', color: colors.gray}}>
+          If you didn't request a password reset, you can safely ignore this email. Your password will remain unchanged.
         </Text>
       </Section>
     </MailBody>
