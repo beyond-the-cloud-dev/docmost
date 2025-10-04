@@ -9,7 +9,7 @@ declare global {
 }
 
 export function getAppName(): string {
-  return "Docmost";
+  return "Wiki";
 }
 
 export function getAppUrl(): string {
