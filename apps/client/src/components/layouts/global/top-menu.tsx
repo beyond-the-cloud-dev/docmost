@@ -11,6 +11,7 @@ import {
   IconCheck,
   IconChevronDown,
   IconDeviceDesktop,
+  IconInfoCircle,
   IconLogout,
   IconMoon,
   IconSettings,
@@ -152,6 +153,14 @@ export default function TopMenu() {
             </Menu.Item>
           </Menu.Sub.Dropdown>
         </Menu.Sub>
+
+        <Menu.Item
+          component={Link}
+          to={APP_ROUTE.ABOUT}
+          leftSection={<IconInfoCircle size={16} />}
+        >
+          {t("About Docmost")}
+        </Menu.Item>
 
         <Menu.Divider />
 
