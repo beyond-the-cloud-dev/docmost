@@ -98,6 +98,7 @@ export default function ExcalidrawView(props: NodeViewProps) {
     const fileName = "diagram.excalidraw.svg";
     const excalidrawSvgFile = await svgStringToFile(svgString, fileName);
 
+    // @ts-ignore
     const pageId = editor.storage?.pageId;
 
     let attachment: IAttachment = null;
@@ -118,7 +119,7 @@ export default function ExcalidrawView(props: NodeViewProps) {
   };
 
   return (
-    <NodeViewWrapper>
+    <NodeViewWrapper data-drag-handle>
       <ReactClearModal
         style={{
           backgroundColor: "rgba(0, 0, 0, 0.5)",

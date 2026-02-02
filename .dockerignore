@@ -2,4 +2,6 @@ node_modules
 .git
 .gitignore
 dist
-data
+/data
+.env*
+.nx

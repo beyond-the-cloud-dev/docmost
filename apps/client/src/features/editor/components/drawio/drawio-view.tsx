@@ -66,6 +66,7 @@ export default function DrawioView(props: NodeViewProps) {
     const fileName = "diagram.drawio.svg";
     const drawioSVGFile = await svgStringToFile(svgString, fileName);
 
+    //@ts-ignore
     const pageId = editor.storage?.pageId;
 
     let attachment: IAttachment = null;
@@ -87,7 +88,7 @@ export default function DrawioView(props: NodeViewProps) {
   };
 
   return (
-    <NodeViewWrapper>
+    <NodeViewWrapper data-drag-handle>
       <Modal.Root opened={opened} onClose={close} fullScreen>
         <Modal.Overlay />
         <Modal.Content style={{ overflow: "hidden" }}>
