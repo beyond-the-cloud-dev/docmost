@@ -27,6 +27,9 @@ jobs:
       uses: docker/build-push-action@v5
       with:
         context: .
+        # Always re-resolve the node base image so Node.js security
+        # releases land on every build.
+        pull: true
         push: true
         tags: ${{ secrets.DOCKERHUB_USERNAME }}/docmost:latest
         cache-from: type=gha
@@ -54,8 +57,9 @@ jobs:
 
           cd /opt/docmost
 
-          echo "Pulling new image from Docker Hub..."
-          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/docmost:latest
+          echo "Pulling new images from Docker Hub..."
+          # Pulls redis too, so it picks up redis:7-alpine security patches.
+          docker compose pull
 
           echo "Stopping old containers..."
           docker compose down
