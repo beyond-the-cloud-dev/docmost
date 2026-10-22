@@ -1,12 +1,14 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { CreatePageDto } from '../dto/create-page.dto';
-import { UpdatePageDto } from '../dto/update-page.dto';
+import { CreatePageDto, ContentFormat } from '../dto/create-page.dto';
+import { ContentOperation, UpdatePageDto } from '../dto/update-page.dto';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { InsertablePage, Page, User } from '@docmost/db/types/entity.types';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import {
@@ -14,11 +16,12 @@ import {
   executeWithCursorPagination,
 } from '@docmost/db/pagination/cursor-pagination';
 import { InjectKysely } from 'nestjs-kysely';
-import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { MovePageDto } from '../dto/move-page.dto';
 import { generateSlugId } from '../../../common/helpers';
-import { executeTx } from '@docmost/db/utils';
+import { getPageTitle } from '../../../common/helpers';
+import { dbOrTx, executeTx } from '@docmost/db/utils';
 import { AttachmentRepo } from '@docmost/db/repos/attachment/attachment.repo';
 import { v7 as uuid7 } from 'uuid';
 import {
@@ -28,7 +31,11 @@ import {
   isAttachmentNode,
   removeMarkTypeFromDoc,
 } from '../../../common/helpers/prosemirror/utils';
-import { jsonToNode, jsonToText } from 'src/collaboration/collaboration.util';
+import {
+  htmlToJson,
+  jsonToNode,
+  jsonToText,
+} from 'src/collaboration/collaboration.util';
 import {
   CopyPageMapEntry,
   ICopyPageAttachment,
@@ -40,6 +47,15 @@ import { Queue } from 'bullmq';
 import { QueueJob, QueueName } from '../../../integrations/queue/constants';
 import { EventName } from '../../../common/events/event.contants';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { CollaborationGateway } from '../../../collaboration/collaboration.gateway';
+import {
+  INTERNAL_LINK_REGEX,
+  extractPageSlugId,
+} from '../../../integrations/export/utils';
+import { markdownToHtml } from '@docmost/editor-ext';
+import { WatcherService } from '../../watcher/watcher.service';
+import { sql } from 'kysely';
+import { TransclusionService } from '../transclusion/transclusion.service';
 
 @Injectable()
 export class PageService {
@@ -47,12 +63,17 @@ export class PageService {
 
   constructor(
     private pageRepo: PageRepo,
+    private pagePermissionRepo: PagePermissionRepo,
     private attachmentRepo: AttachmentRepo,
     @InjectKysely() private readonly db: KyselyDB,
     private readonly storageService: StorageService,
     @InjectQueue(QueueName.ATTACHMENT_QUEUE) private attachmentQueue: Queue,
     @InjectQueue(QueueName.AI_QUEUE) private aiQueue: Queue,
+    @InjectQueue(QueueName.GENERAL_QUEUE) private generalQueue: Queue,
     private eventEmitter: EventEmitter2,
+    private collaborationGateway: CollaborationGateway,
+    private readonly watcherService: WatcherService,
+    private readonly transclusionService: TransclusionService,
   ) {}
 
   async findById(
@@ -72,6 +93,8 @@ export class PageService {
     userId: string,
     workspaceId: string,
     createPageDto: CreatePageDto,
+    trx?: KyselyTransaction,
+    isBase: boolean = false,
   ): Promise<Page> {
     let parentPageId = undefined;
 
@@ -81,14 +104,33 @@ export class PageService {
         createPageDto.parentPageId,
       );
 
-      if (!parentPage || parentPage.spaceId !== createPageDto.spaceId) {
+      if (
+        !parentPage ||
+        parentPage.deletedAt ||
+        parentPage.spaceId !== createPageDto.spaceId
+      ) {
         throw new NotFoundException('Parent page not found');
       }
 
       parentPageId = parentPage.id;
     }
 
-    const createdPage = await this.pageRepo.insertPage({
+    let content = undefined;
+    let textContent = undefined;
+    let ydoc = undefined;
+
+    if (createPageDto?.content && createPageDto?.format) {
+      const prosemirrorJson = await this.parseProsemirrorContent(
+        createPageDto.content,
+        createPageDto.format,
+      );
+
+      content = prosemirrorJson;
+      textContent = jsonToText(prosemirrorJson);
+      ydoc = createYdocFromJson(prosemirrorJson);
+    }
+
+    const page = await this.pageRepo.insertPage({
       slugId: generateSlugId(),
       title: createPageDto.title,
       position: await this.nextPagePosition(
@@ -101,15 +143,46 @@ export class PageService {
       creatorId: userId,
       workspaceId: workspaceId,
       lastUpdatedById: userId,
-    });
+      isBase,
+      content,
+      textContent,
+      ydoc,
+    }, trx);
 
-    return createdPage;
+    if (trx) {
+      // Add the watcher inside the caller's transaction so the async worker
+      // never inserts against an uncommitted page (FK violation on bases).
+      await this.watcherService.addPageWatchers(
+        [userId],
+        page.id,
+        createPageDto.spaceId,
+        workspaceId,
+        trx,
+      );
+    } else {
+      this.generalQueue
+        .add(QueueJob.ADD_PAGE_WATCHERS, {
+          userIds: [userId],
+          pageId: page.id,
+          spaceId: createPageDto.spaceId,
+          workspaceId,
+        })
+        .catch((err) =>
+          this.logger.warn(`Failed to queue add-page-watchers: ${err.message}`),
+        );
+    }
+
+    return page;
   }
 
-  async nextPagePosition(spaceId: string, parentPageId?: string) {
+  async nextPagePosition(
+    spaceId: string,
+    parentPageId?: string,
+    trx?: KyselyTransaction,
+  ) {
     let pagePosition: string;
 
-    const lastPageQuery = this.db
+    const lastPageQuery = dbOrTx(this.db, trx)
       .selectFrom('pages')
       .select(['position'])
       .where('spaceId', '=', spaceId)
@@ -150,22 +223,47 @@ export class PageService {
   async update(
     page: Page,
     updatePageDto: UpdatePageDto,
-    userId: string,
+    user: User,
   ): Promise<Page> {
     const contributors = new Set<string>(page.contributorIds);
-    contributors.add(userId);
+    contributors.add(user.id);
     const contributorIds = Array.from(contributors);
 
     await this.pageRepo.updatePage(
       {
         title: updatePageDto.title,
         icon: updatePageDto.icon,
-        lastUpdatedById: userId,
+        lastUpdatedById: user.id,
         updatedAt: new Date(),
         contributorIds: contributorIds,
       },
       page.id,
     );
+
+    this.generalQueue
+      .add(QueueJob.ADD_PAGE_WATCHERS, {
+        userIds: [user.id],
+        pageId: page.id,
+        spaceId: page.spaceId,
+        workspaceId: page.workspaceId,
+      })
+      .catch((err) =>
+        this.logger.warn(`Failed to queue add-page-watchers: ${err.message}`),
+      );
+
+    if (
+      updatePageDto.content &&
+      updatePageDto.operation &&
+      updatePageDto.format
+    ) {
+      await this.updatePageContent(
+        page.id,
+        updatePageDto.content,
+        updatePageDto.operation,
+        updatePageDto.format,
+        user,
+      );
+    }
 
     return await this.pageRepo.findById(page.id, {
       includeSpace: true,
@@ -176,10 +274,29 @@ export class PageService {
     });
   }
 
+  async updatePageContent(
+    pageId: string,
+    content: string | object,
+    operation: ContentOperation,
+    format: ContentFormat,
+    user: User,
+  ): Promise<void> {
+    const prosemirrorJson = await this.parseProsemirrorContent(content, format);
+
+    const documentName = `page.${pageId}`;
+    await this.collaborationGateway.handleYjsEvent(
+      'updatePageContent',
+      documentName,
+      { operation, prosemirrorJson, user },
+    );
+  }
+
   async getSidebarPages(
     spaceId: string,
     pagination: PaginationOptions,
     pageId?: string,
+    userId?: string,
+    spaceCanEdit?: boolean,
   ): Promise<CursorPaginationResult<Partial<Page> & { hasChildren: boolean }>> {
     let query = this.db
       .selectFrom('pages')
@@ -192,6 +309,7 @@ export class PageService {
         'parentPageId',
         'spaceId',
         'creatorId',
+        'isBase',
         'deletedAt',
       ])
       .select((eb) => this.pageRepo.withHasChildren(eb))
@@ -204,12 +322,17 @@ export class PageService {
       query = query.where('parentPageId', 'is', null);
     }
 
-    return executeWithCursorPagination(query, {
-      perPage: 250,
+    const result = await executeWithCursorPagination(query, {
+      perPage: pagination.limit,
       cursor: pagination.cursor,
       beforeCursor: pagination.beforeCursor,
       fields: [
-        { expression: 'position', direction: 'asc', orderModifier: (ob) => ob.collate('C').asc() },
+        {
+          expression: 'position',
+          direction: 'asc',
+          orderModifier: (ob) => ob.collate('C').asc(),
+          cursorExpression: sql`position collate "C"`,
+        },
         { expression: 'id', direction: 'asc' },
       ],
       parseCursor: (cursor) => ({
@@ -217,57 +340,198 @@ export class PageService {
         id: cursor.id,
       }),
     });
+
+    if (userId && result.items.length > 0) {
+      const hasRestrictions =
+        await this.pagePermissionRepo.hasRestrictedPagesInSpace(spaceId);
+
+      if (!hasRestrictions) {
+        result.items = result.items.map((p: any) => ({
+          ...p,
+          canEdit: spaceCanEdit ?? true,
+        }));
+      } else {
+        const pageIds = result.items.map((p: any) => p.id);
+
+        const accessiblePages =
+          await this.pagePermissionRepo.filterAccessiblePageIdsWithPermissions(
+            pageIds,
+            userId,
+          );
+
+        const permissionMap = new Map(
+          accessiblePages.map((p) => [p.id, p.canEdit]),
+        );
+
+        result.items = result.items
+          .filter((p: any) => permissionMap.has(p.id))
+          .map((p: any) => ({
+            ...p,
+            canEdit: permissionMap.get(p.id) && (spaceCanEdit ?? true),
+          }));
+
+        const pagesWithChildren = result.items.filter(
+          (p: any) => p.hasChildren,
+        );
+        if (pagesWithChildren.length > 0) {
+          const parentIds = pagesWithChildren.map((p: any) => p.id);
+          const parentsWithAccessibleChildren =
+            await this.pagePermissionRepo.getParentIdsWithAccessibleChildren(
+              parentIds,
+              userId,
+            );
+          const hasAccessibleChildrenSet = new Set(
+            parentsWithAccessibleChildren,
+          );
+
+          result.items = result.items.map((p: any) => ({
+            ...p,
+            hasChildren: p.hasChildren && hasAccessibleChildrenSet.has(p.id),
+          }));
+        }
+      }
+    }
+
+    return result;
   }
 
-  async movePageToSpace(rootPage: Page, spaceId: string) {
-    await executeTx(this.db, async (trx) => {
-      // Update root page
-      const nextPosition = await this.nextPagePosition(spaceId);
-      await this.pageRepo.updatePage(
-        { spaceId, parentPageId: null, position: nextPosition },
-        rootPage.id,
+  async movePageToSpace(rootPage: Page, spaceId: string, userId: string) {
+    return executeTx(this.db, async (trx) => {
+      await this.pageRepo.lockPageHierarchySpaces(
+        [rootPage.spaceId, spaceId],
         trx,
       );
-      const pageIds = await this.pageRepo
-        .getPageAndDescendants(rootPage.id, { includeContent: false })
-        .then((pages) => pages.map((page) => page.id));
-      // The first id is the root page id
-      if (pageIds.length > 1) {
-        // Update sub pages
-        await this.pageRepo.updatePages(
-          { spaceId },
-          pageIds.filter((id) => id !== rootPage.id),
+
+      const currentRootPage = await this.pageRepo.findById(rootPage.id, {
+        trx,
+      });
+      if (!currentRootPage || currentRootPage.deletedAt) {
+        throw new NotFoundException('Page to move not found');
+      }
+      if (currentRootPage.spaceId !== rootPage.spaceId) {
+        throw new ConflictException('Page location changed; retry the move');
+      }
+
+      const allPages = await this.pageRepo.getPageAndDescendants(
+        currentRootPage.id,
+        { includeContent: false, trx },
+      );
+      const accessiblePages = await this.filterAccessibleTreePages(
+        allPages,
+        currentRootPage.id,
+        userId,
+        currentRootPage.spaceId,
+      );
+      const accessibleIds = new Set(accessiblePages.map((p) => p.id));
+      const pagesToOrphan = allPages.filter(
+        (p) =>
+          !accessibleIds.has(p.id) &&
+          p.parentPageId &&
+          accessibleIds.has(p.parentPageId),
+      );
+
+      // Orphan inaccessible child pages (make them root pages in original space)
+      for (const page of pagesToOrphan) {
+        const orphanPosition = await this.nextPagePosition(
+          currentRootPage.spaceId,
+          null,
+          trx,
+        );
+        await this.pageRepo.updatePage(
+          { parentPageId: null, position: orphanPosition },
+          page.id,
           trx,
         );
       }
 
-      if (pageIds.length > 0) {
+      // Update root page
+      const nextPosition = await this.nextPagePosition(spaceId, null, trx);
+      await this.pageRepo.updatePage(
+        { spaceId, parentPageId: null, position: nextPosition },
+        currentRootPage.id,
+        trx,
+      );
+
+      const pageIdsToMove = accessiblePages.map((p) => p.id);
+
+      const childPageIds = pageIdsToMove.filter(
+        (id) => id !== currentRootPage.id,
+      );
+
+      if (pageIdsToMove.length > 1) {
+        // Update sub pages (all accessible pages except root)
+        await this.pageRepo.updatePages({ spaceId }, childPageIds, trx);
+      }
+
+      if (pageIdsToMove.length > 0) {
+        await trx
+          .updateTable('pageAccess')
+          .set({ spaceId: spaceId })
+          .where('pageId', 'in', pageIdsToMove)
+          .execute();
+
         // update spaceId in shares
         await trx
           .updateTable('shares')
           .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIds)
+          .where('pageId', 'in', pageIdsToMove)
           .execute();
 
         // Update comments
         await trx
           .updateTable('comments')
           .set({ spaceId: spaceId })
-          .where('pageId', 'in', pageIds)
+          .where('pageId', 'in', pageIdsToMove)
+          .execute();
+
+        // Update page verifications
+        await trx
+          .updateTable('pageVerifications')
+          .set({ spaceId: spaceId })
+          .where('pageId', 'in', pageIdsToMove)
+          .execute();
+
+        // Update notifications — access follows the page after a move
+        await trx
+          .updateTable('notifications')
+          .set({ spaceId: spaceId })
+          .where('pageId', 'in', pageIdsToMove)
           .execute();
 
         // Update attachments
         await this.attachmentRepo.updateAttachmentsByPageId(
           { spaceId },
-          pageIds,
+          pageIdsToMove,
           trx,
         );
 
-        await this.aiQueue.add(QueueJob.PAGE_MOVED_TO_SPACE, {
-          pageId: pageIds,
-          workspaceId: rootPage.workspaceId,
-        });
+        // Update watchers and remove those without access to new space
+        await this.watcherService.movePageWatchersToSpace(
+          pageIdsToMove,
+          spaceId,
+          {
+            trx,
+          },
+        );
+
+        await this.aiQueue.add(
+          QueueJob.PAGE_MOVED_TO_SPACE,
+          {
+            pageIds: pageIdsToMove,
+            spaceId,
+            workspaceId: currentRootPage.workspaceId,
+          },
+          {
+            attempts: 2,
+            backoff: {
+              type: 'fixed',
+              delay: 2 * 60 * 1000,
+            },
+          },
+        );
       }
+
+      return { childPageIds };
     });
   }
 
@@ -290,9 +554,17 @@ export class PageService {
       nextPosition = await this.nextPagePosition(spaceId);
     }
 
-    const pages = await this.pageRepo.getPageAndDescendants(rootPage.id, {
+    const allPages = await this.pageRepo.getPageAndDescendants(rootPage.id, {
       includeContent: true,
     });
+
+    // Filter to only accessible pages while maintaining tree integrity
+    const pages = await this.filterAccessibleTreePages(
+      allPages,
+      rootPage.id,
+      authUser.id,
+      rootPage.spaceId,
+    );
 
     const pageMap = new Map<string, CopyPageMapEntry>();
     pages.forEach((page) => {
@@ -302,6 +574,11 @@ export class PageService {
         oldSlugId: page.slugId,
       });
     });
+
+    const slugIdMap = new Map<string, CopyPageMapEntry>();
+    for (const [, entry] of pageMap) {
+      slugIdMap.set(entry.oldSlugId, entry);
+    }
 
     const attachmentMap = new Map<string, ICopyPageAttachment>();
 
@@ -369,6 +646,39 @@ export class PageService {
               node.attrs.slugId = mappedPage.newSlugId;
             }
           }
+
+          // Remap transclusion-reference source pages to their copies when
+          // the source page is also being duplicated in the same operation.
+          if (node.type.name === 'transclusionReference') {
+            const sourcePageId = node.attrs.sourcePageId;
+            if (sourcePageId && pageMap.has(sourcePageId)) {
+              const mappedPage = pageMap.get(sourcePageId);
+              //@ts-ignore
+              node.attrs.sourcePageId = mappedPage.newPageId;
+            }
+          }
+
+          // Update internal page links in link marks
+          for (const mark of node.marks) {
+            if (
+              mark.type.name === 'link' &&
+              mark.attrs.internal &&
+              mark.attrs.href
+            ) {
+              const match = mark.attrs.href.match(INTERNAL_LINK_REGEX);
+              if (match) {
+                const slugId = extractPageSlugId(match[5]);
+                if (slugId && slugIdMap.has(slugId)) {
+                  const mappedPage = slugIdMap.get(slugId);
+                  //@ts-ignore
+                  mark.attrs.href = mark.attrs.href.replace(
+                    slugId,
+                    mappedPage.newSlugId,
+                  );
+                }
+              }
+            }
+          }
         });
 
         const prosemirrorJson = prosemirrorDoc.toJSON();
@@ -376,7 +686,7 @@ export class PageService {
         // Add "Copy of " prefix to the root page title only for duplicates in same space
         let title = page.title;
         if (isDuplicateInSameSpace && page.id === rootPage.id) {
-          const originalTitle = page.title || 'Untitled';
+          const originalTitle = getPageTitle(page.title);
           title = `Copy of ${originalTitle}`;
         }
 
@@ -406,6 +716,39 @@ export class PageService {
     );
 
     await this.db.insertInto('pages').values(insertablePages).execute();
+
+    // Extract transclusions from every duplicated page and persist them in
+    // one statement. Duplication bypasses Yjs onStoreDocument; brand-new
+    // pages never have prior rows so we can skip the diff and just bulk-insert.
+    try {
+      await this.transclusionService.insertTransclusionsForPages(
+        insertablePages.map((p) => ({
+          id: p.id,
+          workspaceId: p.workspaceId,
+          content: p.content,
+        })),
+      );
+    } catch (err) {
+      this.logger.error(
+        'Failed to insert transclusions for duplicated pages',
+        err,
+      );
+    }
+
+    try {
+      await this.transclusionService.insertReferencesForPages(
+        insertablePages.map((p) => ({
+          id: p.id,
+          workspaceId: p.workspaceId,
+          content: p.content,
+        })),
+      );
+    } catch (err) {
+      this.logger.error(
+        'Failed to insert transclusion references for duplicated pages',
+        err,
+      );
+    }
 
     const insertedPageIds = insertablePages.map((page) => page.id);
     this.eventEmitter.emit(EventName.PAGE_CREATED, {
@@ -479,10 +822,12 @@ export class PageService {
     });
 
     const hasChildren = pages.length > 1;
+    const childPageIds = insertedPageIds.filter((id) => id !== newPageId);
 
     return {
       ...duplicatedPage,
       hasChildren,
+      childPageIds,
     };
   }
 
@@ -494,27 +839,63 @@ export class PageService {
       throw new BadRequestException('Invalid move position');
     }
 
-    let parentPageId = null;
-    if (movedPage.parentPageId === dto.parentPageId) {
-      parentPageId = undefined;
-    } else {
-      // changing the page's parent
-      if (dto.parentPageId) {
-        const parentPage = await this.pageRepo.findById(dto.parentPageId);
-        if (!parentPage || parentPage.spaceId !== movedPage.spaceId) {
-          throw new NotFoundException('Parent page not found');
-        }
-        parentPageId = parentPage.id;
-      }
+    if (dto.parentPageId && dto.parentPageId === dto.pageId) {
+      throw new BadRequestException('A page cannot be its own parent');
     }
 
-    await this.pageRepo.updatePage(
-      {
-        position: dto.position,
-        parentPageId: parentPageId,
-      },
-      dto.pageId,
-    );
+    await executeTx(this.db, async (trx) => {
+      await this.pageRepo.lockPageHierarchySpaces(
+        [movedPage.spaceId],
+        trx,
+      );
+
+      const currentPage = await this.pageRepo.findById(dto.pageId, { trx });
+      if (!currentPage || currentPage.deletedAt) {
+        throw new NotFoundException('Moved page not found');
+      }
+      if (currentPage.spaceId !== movedPage.spaceId) {
+        throw new ConflictException('Page location changed; retry the move');
+      }
+
+      let parentPageId = null;
+      if (currentPage.parentPageId === dto.parentPageId) {
+        parentPageId = undefined;
+      } else {
+        if (dto.parentPageId) {
+          const parentPage = await this.pageRepo.findById(dto.parentPageId, {
+            trx,
+          });
+          if (
+            !parentPage ||
+            parentPage.deletedAt ||
+            parentPage.spaceId !== currentPage.spaceId
+          ) {
+            throw new NotFoundException('Parent page not found');
+          }
+          if (
+            await this.pageRepo.isPageDescendant(
+              dto.pageId,
+              parentPage.id,
+              trx,
+            )
+          ) {
+            throw new BadRequestException(
+              'A page cannot be moved under its descendant',
+            );
+          }
+          parentPageId = parentPage.id;
+        }
+      }
+
+      await this.pageRepo.updatePage(
+        {
+          position: dto.position,
+          parentPageId: parentPageId,
+        },
+        dto.pageId,
+        trx,
+      );
+    });
   }
 
   async getPageBreadCrumbs(childPageId: string) {
@@ -527,12 +908,12 @@ export class PageService {
             'slugId',
             'title',
             'icon',
+            'isBase',
             'position',
             'parentPageId',
             'spaceId',
             'deletedAt',
           ])
-          .select((eb) => this.pageRepo.withHasChildren(eb))
           .where('id', '=', childPageId)
           .where('deletedAt', 'is', null)
           .unionAll((exp) =>
@@ -543,35 +924,29 @@ export class PageService {
                 'p.slugId',
                 'p.title',
                 'p.icon',
+                'p.isBase',
                 'p.position',
                 'p.parentPageId',
                 'p.spaceId',
                 'p.deletedAt',
               ])
-              .select(
-                exp
-                  .selectFrom('pages as child')
-                  .select((eb) =>
-                    eb
-                      .case()
-                      .when(eb.fn.countAll(), '>', 0)
-                      .then(true)
-                      .else(false)
-                      .end()
-                      .as('count'),
-                  )
-                  .whereRef('child.parentPageId', '=', 'id')
-                  .where('child.deletedAt', 'is', null)
-                  .limit(1)
-                  .as('hasChildren'),
-              )
-              //.select((eb) => this.withHasChildren(eb))
               .innerJoin('page_ancestors as pa', 'pa.parentPageId', 'p.id')
               .where('p.deletedAt', 'is', null),
           ),
       )
       .selectFrom('page_ancestors')
-      .selectAll()
+      .selectAll('page_ancestors')
+      .select((eb) =>
+        eb
+          .exists(
+            eb
+              .selectFrom('pages as child')
+              .select(sql`1`.as('one'))
+              .whereRef('child.parentPageId', '=', 'page_ancestors.id')
+              .where('child.deletedAt', 'is', null),
+          )
+          .as('hasChildren'),
+      )
       .execute();
 
     return ancestors.reverse();
@@ -579,23 +954,99 @@ export class PageService {
 
   async getRecentSpacePages(
     spaceId: string,
+    userId: string,
     pagination: PaginationOptions,
   ): Promise<CursorPaginationResult<Page>> {
-    return this.pageRepo.getRecentPagesInSpace(spaceId, pagination);
+    const result = await this.pageRepo.getRecentPagesInSpace(
+      spaceId,
+      pagination,
+    );
+
+    if (result.items.length > 0) {
+      const pageIds = result.items.map((p) => p.id);
+      const accessibleIds =
+        await this.pagePermissionRepo.filterAccessiblePageIds({
+          pageIds,
+          userId,
+          spaceId,
+        });
+      const accessibleSet = new Set(accessibleIds);
+      result.items = result.items.filter((p) => accessibleSet.has(p.id));
+    }
+
+    return result;
   }
 
   async getRecentPages(
     userId: string,
     pagination: PaginationOptions,
   ): Promise<CursorPaginationResult<Page>> {
-    return this.pageRepo.getRecentPages(userId, pagination);
+    const result = await this.pageRepo.getRecentPages(userId, pagination);
+
+    if (result.items.length > 0) {
+      const pageIds = result.items.map((p) => p.id);
+      const accessibleIds =
+        await this.pagePermissionRepo.filterAccessiblePageIds({
+          pageIds,
+          userId,
+        });
+      const accessibleSet = new Set(accessibleIds);
+      result.items = result.items.filter((p) => accessibleSet.has(p.id));
+    }
+
+    return result;
+  }
+
+  async getCreatedByPages(
+    creatorId: string,
+    requestingUserId: string,
+    pagination: PaginationOptions,
+    spaceId?: string,
+  ): Promise<CursorPaginationResult<Page>> {
+    const result = await this.pageRepo.getCreatedByPages(
+      creatorId,
+      requestingUserId,
+      pagination,
+      spaceId,
+    );
+
+    if (result.items.length > 0) {
+      const pageIds = result.items.map((p) => p.id);
+      const accessibleIds =
+        await this.pagePermissionRepo.filterAccessiblePageIds({
+          pageIds,
+          userId: requestingUserId,
+        });
+      const accessibleSet = new Set(accessibleIds);
+      result.items = result.items.filter((p) => accessibleSet.has(p.id));
+    }
+
+    return result;
   }
 
   async getDeletedSpacePages(
     spaceId: string,
+    userId: string,
     pagination: PaginationOptions,
   ): Promise<CursorPaginationResult<Page>> {
-    return this.pageRepo.getDeletedPagesInSpace(spaceId, pagination);
+    const result = await this.pageRepo.getDeletedPagesInSpace(
+      spaceId,
+      pagination,
+    );
+
+    if (result.items.length > 0) {
+      const pageIds = result.items.map((p) => p.id);
+      const accessibleIds =
+        await this.pagePermissionRepo.filterAccessiblePageIds({
+          pageIds,
+          userId,
+          spaceId,
+        });
+      const accessibleSet = new Set(accessibleIds);
+      result.items = result.items.filter((p) => accessibleSet.has(p.id));
+    }
+
+    return result;
   }
 
   async forceDelete(pageId: string, workspaceId: string): Promise<void> {
@@ -652,5 +1103,94 @@ export class PageService {
     workspaceId: string,
   ): Promise<void> {
     await this.pageRepo.removePage(pageId, userId, workspaceId);
+  }
+
+  private async parseProsemirrorContent(
+    content: string | object,
+    format: ContentFormat,
+  ): Promise<any> {
+    let prosemirrorJson: any;
+
+    switch (format) {
+      case 'markdown': {
+        const html = await markdownToHtml(content as string);
+        prosemirrorJson = htmlToJson(html as string);
+        break;
+      }
+      case 'html': {
+        prosemirrorJson = htmlToJson(content as string);
+        break;
+      }
+      case 'json':
+      default: {
+        prosemirrorJson = content;
+        break;
+      }
+    }
+
+    try {
+      jsonToNode(prosemirrorJson);
+    } catch (err) {
+      throw new BadRequestException('Invalid content format');
+    }
+
+    return prosemirrorJson;
+  }
+
+  /**
+   * Filters a list of pages to only those accessible to the user while maintaining tree integrity.
+   * A page is included only if:
+   * 1. The user has access to it
+   * 2. Its parent is also included (or it's the root page)
+   * This ensures that if a middle page is inaccessible, its entire subtree is excluded.
+   */
+  private async filterAccessibleTreePages<
+    T extends { id: string; parentPageId: string | null },
+  >(
+    pages: T[],
+    rootPageId: string,
+    userId: string,
+    spaceId?: string,
+  ): Promise<T[]> {
+    if (pages.length === 0) return [];
+
+    const pageIds = pages.map((p) => p.id);
+    const accessibleIds = await this.pagePermissionRepo.filterAccessiblePageIds(
+      {
+        pageIds,
+        userId,
+        spaceId,
+      },
+    );
+    const accessibleSet = new Set(accessibleIds);
+
+    // Prune: include a page only if it's accessible AND its parent chain to root is included
+    const includedIds = new Set<string>();
+
+    // Process pages in a way that ensures parents are processed before children
+    // We do this by iterating until no more pages can be added
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const page of pages) {
+        if (includedIds.has(page.id)) continue;
+        if (!accessibleSet.has(page.id)) continue;
+
+        // Root page: include if accessible
+        if (page.id === rootPageId) {
+          includedIds.add(page.id);
+          changed = true;
+          continue;
+        }
+
+        // Non-root: include if parent is already included
+        if (page.parentPageId && includedIds.has(page.parentPageId)) {
+          includedIds.add(page.id);
+          changed = true;
+        }
+      }
+    }
+
+    return pages.filter((p) => includedIds.has(p.id));
   }
 }

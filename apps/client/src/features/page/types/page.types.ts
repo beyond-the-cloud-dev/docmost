@@ -12,16 +12,29 @@ export interface IPage {
   spaceId: string;
   workspaceId: string;
   isLocked: boolean;
+  isBase: boolean;
   lastUpdatedById: string;
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date;
   position: string;
   hasChildren: boolean;
+  canEdit?: boolean;
   creator: ICreator;
   lastUpdatedBy: ILastUpdatedBy;
   deletedBy: IDeletedBy;
+  contributors?: IContributor[];
   space: Partial<ISpace>;
+  permissions?: {
+    canEdit: boolean;
+    hasRestriction: boolean;
+  };
+}
+
+export interface IContributor {
+  id: string;
+  name: string;
+  avatarUrl: string;
 }
 
 interface ICreator {
@@ -63,6 +76,7 @@ export interface SidebarPagesParams {
   spaceId?: string;
   pageId?: string;
   cursor?: string;
+  limit?: number;
 }
 
 export interface IPageInput {
@@ -85,4 +99,5 @@ export interface IExportPageParams {
 export enum ExportFormat {
   HTML = "html",
   Markdown = "markdown",
+  Docx = "docx",
 }

@@ -33,6 +33,8 @@ export class WorkspaceRepo {
     'enforceSso',
     'plan',
     'enforceMfa',
+    'trashRetentionDays',
+    'isScimEnabled',
   ];
   constructor(@InjectKysely() private readonly db: KyselyDB) {}
 
@@ -65,6 +67,17 @@ export class WorkspaceRepo {
     }
 
     return query.executeTakeFirst();
+  }
+
+  async findLicenseKeyById(
+    workspaceId: string,
+  ): Promise<string | undefined> {
+    const row = await this.db
+      .selectFrom('workspaces')
+      .select('licenseKey')
+      .where('id', '=', workspaceId)
+      .executeTakeFirst();
+    return row?.licenseKey;
   }
 
   async findFirst(): Promise<Workspace> {
@@ -162,12 +175,14 @@ export class WorkspaceRepo {
     workspaceId: string,
     prefKey: string,
     prefValue: string | boolean,
+    trx?: KyselyTransaction,
   ) {
-    return this.db
+    const db = dbOrTx(this.db, trx);
+    return db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
-                || jsonb_build_object('api', COALESCE(settings->'api', '{}'::jsonb) 
+                || jsonb_build_object('api', COALESCE(settings->'api', '{}'::jsonb)
                 || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
         updatedAt: new Date(),
       })
@@ -180,12 +195,14 @@ export class WorkspaceRepo {
     workspaceId: string,
     prefKey: string,
     prefValue: string | boolean,
+    trx?: KyselyTransaction,
   ) {
-    return this.db
+    const db = dbOrTx(this.db, trx);
+    return db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
-                || jsonb_build_object('ai', COALESCE(settings->'ai', '{}'::jsonb) 
+                || jsonb_build_object('ai', COALESCE(settings->'ai', '{}'::jsonb)
                 || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
         updatedAt: new Date(),
       })
@@ -193,4 +210,121 @@ export class WorkspaceRepo {
       .returning(this.baseFields)
       .executeTakeFirst();
   }
+
+  async updateAiEmbeddingFingerprint(
+    workspaceId: string,
+    fingerprint: { driver: string; model: string; dimensions: number },
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+                || jsonb_build_object('ai', COALESCE(settings->'ai', '{}'::jsonb)
+                || jsonb_build_object('embedding', ${JSON.stringify(fingerprint)}::text::jsonb))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .execute();
+  }
+
+  async updateSharingSettings(
+    workspaceId: string,
+    prefKey: string,
+    prefValue: string | boolean,
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+                || jsonb_build_object('sharing', COALESCE(settings->'sharing', '{}'::jsonb)
+                || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  async updatePublicSpacesSettings(
+    workspaceId: string,
+    prefKey: string,
+    prefValue: string | boolean,
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+                || jsonb_build_object('publicSpaces', COALESCE(settings->'publicSpaces', '{}'::jsonb)
+                || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  async updateTemplateSettings(
+    workspaceId: string,
+    prefKey: string,
+    prefValue: string | boolean,
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+                || jsonb_build_object('templates', COALESCE(settings->'templates', '{}'::jsonb)
+                || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  async updateSpaceSettings(
+    workspaceId: string,
+    prefKey: string,
+    prefValue: string | boolean,
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+                || jsonb_build_object('spaces', COALESCE(settings->'spaces', '{}'::jsonb)
+                || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  async updateDefaultPageEditMode(
+    workspaceId: string,
+    pageEditMode: string,
+    trx?: KyselyTransaction,
+  ) {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb)
+                || jsonb_build_object('defaultPageEditMode', ${sql.lit(pageEditMode)})`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
 }

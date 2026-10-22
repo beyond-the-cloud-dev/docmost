@@ -1,9 +1,7 @@
 import React, { useState } from "react";
-import { Button, Group, Space, Text } from "@mantine/core";
-import { Helmet } from "react-helmet-async";
-import { useTranslation } from "react-i18next";
+import { Anchor, Button, Divider, Group, Space, Text } from "@mantine/core";
+import { Trans, useTranslation } from "react-i18next";
 import SettingsTitle from "@/components/settings/settings-title";
-import { getAppName } from "@/lib/config";
 import { ApiKeyTable } from "@/ee/api-key/components/api-key-table";
 import { CreateApiKeyModal } from "@/ee/api-key/components/create-api-key-modal";
 import { ApiKeyCreatedModal } from "@/ee/api-key/components/api-key-created-modal";
@@ -14,6 +12,8 @@ import { useCursorPaginate } from "@/hooks/use-cursor-paginate";
 import { useGetApiKeysQuery } from "@/ee/api-key/queries/api-key-query.ts";
 import { IApiKey } from "@/ee/api-key";
 import useUserRole from '@/hooks/use-user-role.tsx';
+import RestrictApiToAdmins from "@/ee/api-key/components/restrict-api-to-admins";
+import { DocumentTitle } from "@/components/ui/document-title.tsx";
 
 export default function WorkspaceApiKeys() {
   const { t } = useTranslation();
@@ -46,17 +46,21 @@ export default function WorkspaceApiKeys() {
 
   return (
     <>
-      <Helmet>
-        <title>
-          {t("API management")} - {getAppName()}
-        </title>
-      </Helmet>
+      <DocumentTitle title={t("API management")} />
 
       <SettingsTitle title={t("API management")} />
 
-      <Text size="md" c="dimmed" mb="md">
-        {t("Manage API keys for all users in the workspace")}
+      <Text size="sm" c="dimmed" mb="md">
+        <Trans
+          i18nKey="Manage API keys for all users in the workspace. View the <anchor>API documentation</anchor> for usage details."
+          components={{
+            anchor: <Anchor href="https://docmost.com/api-docs" target="_blank" size="sm" />,
+          }}
+        />
       </Text>
+
+      <RestrictApiToAdmins />
+      <Divider my="lg" />
 
       <Group justify="flex-end" mb="md">
         <Button onClick={() => setCreateModalOpened(true)}>
